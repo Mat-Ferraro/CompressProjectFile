@@ -4,6 +4,8 @@ import json
 import sys
 import os
 import subprocess
+import zipfile
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -132,7 +134,72 @@ def is_excluded(path: Path, scan_root: Path) -> bool:
     return any(part in EXCLUDED_DIRS for part in rel_parts)
 
 
+def read_docx_text(path: Path) -> str:
+    """Extract readable plain text from a .docx file using only the Python standard library.
+
+    A .docx file is a ZIP package containing XML parts. Reading it as raw text produces
+    unreadable PK/ZIP binary content, so this extracts the visible Word document text instead.
+    """
+    namespaces = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    }
+
+    def extract_paragraph_text(paragraph: ET.Element) -> str:
+        pieces: list[str] = []
+        for node in paragraph.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag == "t" and node.text:
+                pieces.append(node.text)
+            elif tag == "tab":
+                pieces.append("\t")
+            elif tag in {"br", "cr"}:
+                pieces.append("\n")
+        return "".join(pieces).strip()
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            part_names = [
+                "word/document.xml",
+                *sorted(name for name in zf.namelist() if name.startswith("word/header") and name.endswith(".xml")),
+                *sorted(name for name in zf.namelist() if name.startswith("word/footer") and name.endswith(".xml")),
+            ]
+
+            sections: list[str] = []
+            for part_name in part_names:
+                if part_name not in zf.namelist():
+                    continue
+
+                try:
+                    xml_data = zf.read(part_name)
+                    root = ET.fromstring(xml_data)
+                except Exception as ex:
+                    sections.append(f"[ERROR READING DOCX PART {part_name}: {ex}]")
+                    continue
+
+                paragraphs: list[str] = []
+                for paragraph in root.findall(".//w:p", namespaces):
+                    text = extract_paragraph_text(paragraph)
+                    if text:
+                        paragraphs.append(text)
+
+                if paragraphs:
+                    if part_name != "word/document.xml":
+                        sections.append(f"[{part_name}]\n" + "\n".join(paragraphs))
+                    else:
+                        sections.append("\n".join(paragraphs))
+
+            return "\n\n".join(sections).strip() or "[DOCX file contained no extractable text]"
+    except zipfile.BadZipFile:
+        return "[ERROR: File has .docx extension but is not a valid DOCX/ZIP package]"
+    except Exception as ex:
+        return f"[ERROR READING DOCX FILE: {ex}]"
+
+
 def safe_read_text(path: Path) -> str:
+    if normalize_extension(path) == ".docx":
+        return read_docx_text(path)
+
     encodings = ["utf-8", "utf-8-sig", "cp1252", "latin-1"]
     for enc in encodings:
         try:
@@ -307,6 +374,13 @@ def write_bundle(
         for ext in selected_extensions:
             f.write(f"- {ext}\n")
         f.write("\n")
+
+        if any(normalize_extension(path) == ".docx" for path in included_files):
+            f.write("DOCUMENT EXTRACTION NOTES\n")
+            f.write(SUB_BAR + "\n")
+            f.write("- .docx files are ZIP/XML packages, so their visible document text is extracted instead of raw binary content.\n")
+            f.write("- Formatting, images, and complex Word layout are not preserved in this text bundle.\n")
+            f.write("\n")
 
         if ignored_paths:
             f.write("IGNORED TREE PATHS\n")
